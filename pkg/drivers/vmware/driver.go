@@ -215,12 +215,104 @@ func (d *Driver) Create() error {
 			return err
 		}
 
-		if err := vdiskmanager(diskImg, d.DiskSize); err != nil {
+		if err := d.generateDiskImage(); err != nil {
 			return err
 		}
 	}
 
 	return d.Start()
+}
+
+func (d *Driver) generateDiskImage() error {
+	diskImg := d.ResolveStorePath(fmt.Sprintf("%s.vmdk", d.MachineName))
+
+	log.Infof("Creating %d MB hard disk image at %s...", d.DiskSize, diskImg)
+
+	magicString := "boot2docker, please format-me"
+
+	buf := new(bytes.Buffer)
+	tw := tar.NewWriter(buf)
+
+	// magicString first so the automount script knows to format the disk
+	file := &tar.Header{Name: magicString, Size: int64(len(magicString))}
+	if err := tw.WriteHeader(file); err != nil {
+		return err
+	}
+	if _, err := tw.Write([]byte(magicString)); err != nil {
+		return err
+	}
+	// .ssh/key.pub => authorized_keys
+	file = &tar.Header{Name: ".ssh", Typeflag: tar.TypeDir, Mode: 0700}
+	if err := tw.WriteHeader(file); err != nil {
+		return err
+	}
+	pubKey, err := os.ReadFile(d.publicSSHKeyPath())
+	if err != nil {
+		return err
+	}
+	file = &tar.Header{Name: ".ssh/authorized_keys", Size: int64(len(pubKey)), Mode: 0644}
+	if err := tw.WriteHeader(file); err != nil {
+		return err
+	}
+	if _, err := tw.Write(pubKey); err != nil {
+		return err
+	}
+	file = &tar.Header{Name: ".ssh/authorized_keys2", Size: int64(len(pubKey)), Mode: 0644}
+	if err := tw.WriteHeader(file); err != nil {
+		return err
+	}
+	if _, err := tw.Write(pubKey); err != nil {
+		return err
+	}
+	if err := tw.Close(); err != nil {
+		return err
+	}
+
+	// we create a 1 MB temporary preallocated disk
+	// this will create 2 files:
+	// - ${name}-tmp.vmdk - a text file containing disk metadata
+	// - ${name}-tmp-flat.vmdk - disk raw data, initially filled with zeroes
+	// where ${name}.vmdk is the expected disk filename
+	tmpDiskPath := strings.Replace(diskImg, ".vmdk", "-tmp.vmdk", 1)
+	err = createDisk(tmpDiskPath, 1, diskTypePreallocated)
+	if err != nil {
+		return err
+	}
+
+	// we write the tar stream at the beginning of the temporary disk raw data
+	tmpFlatPath := strings.Replace(tmpDiskPath, "-tmp.vmdk", "-tmp-flat.vmdk", 1)
+	f, err := os.OpenFile(tmpFlatPath, os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	_, err = f.WriteAt(buf.Bytes(), 0)
+	f.Close()
+	if err != nil {
+		return err
+	}
+
+	// we convert the temporary disk to a single, growable expected disk
+	err = convertDisk(tmpDiskPath, diskImg, diskTypeGrowable)
+	if err != nil {
+		return err
+	}
+	// and grow it to the expected size
+	err = growDisk(diskImg, d.DiskSize)
+	if err != nil {
+		return err
+	}
+
+	// finally, we clean up the temporary disk
+	err = os.Remove(tmpFlatPath)
+	if err != nil {
+		return err
+	}
+	err = os.Remove(tmpDiskPath)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func (d *Driver) Start() error {
