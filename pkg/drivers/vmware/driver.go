@@ -24,7 +24,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -40,7 +40,6 @@ import (
 	"github.com/docker/machine/libmachine/ssh"
 	"github.com/docker/machine/libmachine/state"
 	"github.com/machine-drivers/docker-machine-driver-vmware/pkg/drivers/vmware/config"
-	cryptossh "golang.org/x/crypto/ssh"
 )
 
 const (
@@ -95,7 +94,7 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 	// We support a maximum of 16 cpu to be consistent with Virtual Hardware 10
 	// specs.
 	if d.CPU < 1 {
-		d.CPU = int(runtime.NumCPU())
+		d.CPU = runtime.NumCPU()
 	}
 	if d.CPU > 16 {
 		d.CPU = 16
@@ -172,7 +171,9 @@ func (d *Driver) PreCreateCheck() error {
 }
 
 func (d *Driver) Create() error {
-	os.MkdirAll(filepath.Join(d.StorePath, "machines", d.GetMachineName()), 0755)
+	if err := os.MkdirAll(filepath.Join(d.StorePath, "machines", d.GetMachineName()), 0755); err != nil {
+		return err
+	}
 
 	b2dutils := mcnutils.NewB2dUtils(d.StorePath)
 	if err := b2dutils.CopyIsoToMachineDir(d.Boot2DockerURL, d.MachineName); err != nil {
@@ -206,16 +207,18 @@ func (d *Driver) Create() error {
 	if err != nil {
 		return err
 	}
-	vmxt.Execute(vmxfile, d)
+	if err = vmxt.Execute(vmxfile, d); err != nil {
+		return err
+	}
 
 	// Generate vmdk file
-	diskImg := d.ResolveStorePath(fmt.Sprintf("%s.vmdk", d.MachineName))
+	diskImg := d.vmdkPath()
 	if _, err := os.Stat(diskImg); err != nil {
 		if !os.IsNotExist(err) {
 			return err
 		}
 
-		if err := vdiskmanager(diskImg, d.DiskSize); err != nil {
+		if err := d.generateDiskImage(); err != nil {
 			return err
 		}
 	}
@@ -223,12 +226,107 @@ func (d *Driver) Create() error {
 	return d.Start()
 }
 
-func (d *Driver) Start() error {
-	log.Infof("Starting %s...", d.MachineName)
-	vmrun("start", d.vmxPath(), "nogui")
+func (d *Driver) generateDiskImage() error {
+	diskImg := d.vmdkPath()
 
+	log.Infof("Creating %d MB hard disk image at %s...", d.DiskSize, diskImg)
+
+	magicString := "boot2docker, please format-me"
+
+	buf := new(bytes.Buffer)
+	tw := tar.NewWriter(buf)
+
+	// magicString first so the automount script knows to format the disk
+	file := &tar.Header{Name: magicString, Size: int64(len(magicString))}
+	if err := tw.WriteHeader(file); err != nil {
+		return err
+	}
+	if _, err := tw.Write([]byte(magicString)); err != nil {
+		return err
+	}
+	// .ssh/key.pub => authorized_keys
+	file = &tar.Header{Name: ".ssh", Typeflag: tar.TypeDir, Mode: 0700}
+	if err := tw.WriteHeader(file); err != nil {
+		return err
+	}
+	pubKey, err := os.ReadFile(d.publicSSHKeyPath())
+	if err != nil {
+		return err
+	}
+	file = &tar.Header{Name: ".ssh/authorized_keys", Size: int64(len(pubKey)), Mode: 0644}
+	if err := tw.WriteHeader(file); err != nil {
+		return err
+	}
+	if _, err := tw.Write(pubKey); err != nil {
+		return err
+	}
+	file = &tar.Header{Name: ".ssh/authorized_keys2", Size: int64(len(pubKey)), Mode: 0644}
+	if err := tw.WriteHeader(file); err != nil {
+		return err
+	}
+	if _, err := tw.Write(pubKey); err != nil {
+		return err
+	}
+	if err := tw.Close(); err != nil {
+		return err
+	}
+
+	// we create a 1 MB temporary preallocated disk
+	// this will create 2 files:
+	// - ${name}-tmp.vmdk - a text file containing disk metadata
+	// - ${name}-tmp-flat.vmdk - disk raw data, initially filled with zeroes
+	// where ${name}.vmdk is the expected disk filename
+	tmpDiskPath := strings.Replace(diskImg, ".vmdk", "-tmp.vmdk", 1)
+	err = createDisk(tmpDiskPath, 1, diskTypePreallocated)
+	if err != nil {
+		return err
+	}
+
+	// we write the tar stream at the beginning of the temporary disk raw data
+	tmpFlatPath := strings.Replace(tmpDiskPath, "-tmp.vmdk", "-tmp-flat.vmdk", 1)
+	f, err := os.OpenFile(tmpFlatPath, os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	_, err = f.WriteAt(buf.Bytes(), 0)
+	f.Close()
+	if err != nil {
+		return err
+	}
+
+	// we convert the temporary disk to a single, growable expected disk
+	err = convertDisk(tmpDiskPath, diskImg, diskTypeGrowable)
+	if err != nil {
+		return err
+	}
+	// and grow it to the expected size
+	err = growDisk(diskImg, d.DiskSize)
+	if err != nil {
+		return err
+	}
+
+	// finally, we clean up the temporary disk
+	err = os.Remove(tmpFlatPath)
+	if err != nil {
+		return err
+	}
+	err = os.Remove(tmpDiskPath)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (d *Driver) Start() error {
 	var ip string
 	var err error
+
+	log.Infof("Starting %s...", d.MachineName)
+	_, _, err = vmrun("start", d.vmxPath(), "nogui")
+	if err != nil {
+		return err
+	}
 
 	log.Infof("Waiting for VM to come online...")
 	for i := 1; i <= 60; i++ {
@@ -241,7 +339,7 @@ func (d *Driver) Start() error {
 
 		if ip != "" {
 			log.Debugf("Got an ip: %s", ip)
-			conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", ip, 22), time.Duration(2*time.Second))
+			conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", ip, 22), 2*time.Second)
 			if err != nil {
 				log.Debugf("SSH Daemon not responding yet: %s", err)
 				time.Sleep(2 * time.Second)
@@ -253,81 +351,12 @@ func (d *Driver) Start() error {
 	}
 
 	if ip == "" {
-		return fmt.Errorf("Machine didn't return an IP after 120 seconds, aborting")
+		return fmt.Errorf("machine didn't return an IP after 120 seconds, aborting")
 	}
 
-	// we got an IP, let's copy ssh keys over
+	// we got an IP
 	d.IPAddress = ip
 
-	// Do not execute the rest of boot2docker specific configuration
-	// The upload of the public ssh key uses a ssh connection,
-	// this works without installed vmware client tools
-	if d.ConfigDriveURL != "" {
-		var keyfh *os.File
-		var keycontent []byte
-
-		log.Infof("Copy public SSH key to %s [%s]", d.MachineName, d.IPAddress)
-
-		// create .ssh folder in users home
-		if err := executeSSHCommand(fmt.Sprintf("mkdir -p /home/%s/.ssh", d.SSHUser), d); err != nil {
-			return err
-		}
-
-		// read generated public ssh key
-		if keyfh, err = os.Open(d.publicSSHKeyPath()); err != nil {
-			return err
-		}
-		defer keyfh.Close()
-
-		if keycontent, err = ioutil.ReadAll(keyfh); err != nil {
-			return err
-		}
-
-		// add public ssh key to authorized_keys
-		if err := executeSSHCommand(fmt.Sprintf("echo '%s' > /home/%s/.ssh/authorized_keys", string(keycontent), d.SSHUser), d); err != nil {
-			return err
-		}
-
-		// make it secure
-		if err := executeSSHCommand(fmt.Sprintf("chmod 600 /home/%s/.ssh/authorized_keys", d.SSHUser), d); err != nil {
-			return err
-		}
-
-		log.Debugf("Leaving create sequence early, configdrive found")
-		return nil
-	}
-
-	// Generate a tar keys bundle
-	if err := d.generateKeyBundle(); err != nil {
-		return err
-	}
-
-	// Test if /var/lib/boot2docker exists
-	vmrun("-gu", d.SSHUser, "-gp", d.SSHPassword, "directoryExistsInGuest", d.vmxPath(), "/var/lib/boot2docker")
-
-	// Copy SSH keys bundle
-	vmrun("-gu", d.SSHUser, "-gp", d.SSHPassword, "CopyFileFromHostToGuest", d.vmxPath(), d.ResolveStorePath("userdata.tar"), "/home/docker/userdata.tar")
-
-	// Expand tar file.
-	vmrun("-gu", d.SSHUser, "-gp", d.SSHPassword, "runScriptInGuest", d.vmxPath(), "/bin/sh", "sudo sh -c \"tar xvf /home/docker/userdata.tar -C /home/docker > /var/log/userdata.log 2>&1 && chown -R docker:staff /home/docker\"")
-
-	// copy to /var/lib/boot2docker
-	vmrun("-gu", d.SSHUser, "-gp", d.SSHPassword, "runScriptInGuest", d.vmxPath(), "/bin/sh", "sudo /bin/mv /home/docker/userdata.tar /var/lib/boot2docker/userdata.tar")
-
-	// Enable Shared Folders
-	vmrun("-gu", d.SSHUser, "-gp", d.SSHPassword, "enableSharedFolders", d.vmxPath())
-
-	shareName, hostDir, shareDir := getShareDriveAndName()
-	if hostDir != "" && !d.NoShare {
-		if _, err := os.Stat(hostDir); err != nil && !os.IsNotExist(err) {
-			return err
-		} else if !os.IsNotExist(err) {
-			// add shared folder, create mountpoint and mount it.
-			vmrun("-gu", d.SSHUser, "-gp", d.SSHPassword, "addSharedFolder", d.vmxPath(), shareName, hostDir)
-			command := mountCommand(shareName, shareDir)
-			vmrun("-gu", d.SSHUser, "-gp", d.SSHPassword, "runScriptInGuest", d.vmxPath(), "/bin/sh", command)
-		}
-	}
 	return nil
 }
 
@@ -354,11 +383,13 @@ func (d *Driver) Remove() error {
 	s, _ := d.GetState()
 	if s == state.Running {
 		if err := d.Kill(); err != nil {
-			return fmt.Errorf("Error stopping VM before deletion")
+			return fmt.Errorf("error stopping VM before deletion")
 		}
 	}
 	log.Infof("Deleting %s...", d.MachineName)
-	vmrun("deleteVM", d.vmxPath(), "nogui")
+	if _, _, err := vmrun("deleteVM", d.vmxPath(), "nogui"); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -384,7 +415,7 @@ func (d *Driver) getMacAddressFromVmx() (string, error) {
 	}
 	defer vmxfh.Close()
 
-	if vmxcontent, err = ioutil.ReadAll(vmxfh); err != nil {
+	if vmxcontent, err = io.ReadAll(vmxfh); err != nil {
 		return "", err
 	}
 
@@ -392,11 +423,11 @@ func (d *Driver) getMacAddressFromVmx() (string, error) {
 	var macaddr string
 	vmxparse := regexp.MustCompile(`^ethernet0.generatedAddress\s*=\s*"(.*?)"\s*$`)
 	for _, line := range strings.Split(string(vmxcontent), "\n") {
-		if matches := vmxparse.FindStringSubmatch(line); matches == nil {
+		matches := vmxparse.FindStringSubmatch(line)
+		if matches == nil {
 			continue
-		} else {
-			macaddr = strings.ToLower(matches[1])
 		}
+		macaddr = strings.ToLower(matches[1])
 	}
 
 	if macaddr == "" {
@@ -412,7 +443,7 @@ func (d *Driver) getIPfromVmrun() (string, error) {
 	vmx := d.vmxPath()
 
 	ip := regexp.MustCompile(`\d+\.\d+\.\d+\.\d+`)
-	stdout, _, _ := vmrun_wait(time.Duration(d.WaitIP)*time.Millisecond, "getGuestIPAddress", vmx, "-wait")
+	stdout, _, _ := vmrunWait(time.Duration(d.WaitIP)*time.Millisecond, "getGuestIPAddress", vmx, "-wait")
 	if match := ip.FindString(stdout); match != "" {
 		return match, nil
 	}
@@ -449,7 +480,7 @@ func (d *Driver) getIPfromVmnetConfigurationFile(conffile, macaddr string) (stri
 	}
 	defer conffh.Close()
 
-	if confcontent, err = ioutil.ReadAll(conffh); err != nil {
+	if confcontent, err = io.ReadAll(conffh); err != nil {
 		return "", err
 	}
 
@@ -475,14 +506,14 @@ func (d *Driver) getIPfromVmnetConfigurationFile(conffile, macaddr string) (stri
 	for _, line := range strings.Split(string(confcontent), "\n") {
 
 		if matches := hostbegin.FindStringSubmatch(line); matches != nil {
-			blockdepth = blockdepth + 1
+			blockdepth++
 			continue
 		}
 
 		// we are only in interested in endings if we in a block. Otherwise we will count
 		// ending of non host blocks as well
 		if matches := hostend.FindStringSubmatch(line); blockdepth > 0 && matches != nil {
-			blockdepth = blockdepth - 1
+			blockdepth--
 
 			if blockdepth == 0 {
 				// add data
@@ -554,7 +585,7 @@ func (d *Driver) getIPfromDHCPLeaseFile(dhcpfile, macaddr string) (string, error
 	}
 	defer dhcpfh.Close()
 
-	if dhcpcontent, err = ioutil.ReadAll(dhcpfh); err != nil {
+	if dhcpcontent, err = io.ReadAll(dhcpfh); err != nil {
 		return "", err
 	}
 
@@ -594,97 +625,4 @@ func (d *Driver) getIPfromDHCPLeaseFile(dhcpfile, macaddr string) (string, error
 
 func (d *Driver) publicSSHKeyPath() string {
 	return d.GetSSHKeyPath() + ".pub"
-}
-
-// Make a boot2docker userdata.tar key bundle
-func (d *Driver) generateKeyBundle() error {
-	log.Debugf("Creating Tar key bundle...")
-
-	magicString := "boot2docker, this is vmware speaking"
-
-	tf, err := os.Create(d.ResolveStorePath("userdata.tar"))
-	if err != nil {
-		return err
-	}
-	defer tf.Close()
-	var fileWriter = tf
-
-	tw := tar.NewWriter(fileWriter)
-	defer tw.Close()
-
-	// magicString first so we can figure out who originally wrote the tar.
-	file := &tar.Header{Name: magicString, Size: int64(len(magicString))}
-	if err := tw.WriteHeader(file); err != nil {
-		return err
-	}
-	if _, err := tw.Write([]byte(magicString)); err != nil {
-		return err
-	}
-	// .ssh/key.pub => authorized_keys
-	file = &tar.Header{Name: ".ssh", Typeflag: tar.TypeDir, Mode: 0700}
-	if err := tw.WriteHeader(file); err != nil {
-		return err
-	}
-	pubKey, err := ioutil.ReadFile(d.publicSSHKeyPath())
-	if err != nil {
-		return err
-	}
-	file = &tar.Header{Name: ".ssh/authorized_keys", Size: int64(len(pubKey)), Mode: 0644}
-	if err := tw.WriteHeader(file); err != nil {
-		return err
-	}
-	if _, err := tw.Write([]byte(pubKey)); err != nil {
-		return err
-	}
-	file = &tar.Header{Name: ".ssh/authorized_keys2", Size: int64(len(pubKey)), Mode: 0644}
-	if err := tw.WriteHeader(file); err != nil {
-		return err
-	}
-	if _, err := tw.Write([]byte(pubKey)); err != nil {
-		return err
-	}
-
-	return tw.Close()
-}
-
-// execute command over SSH with user / password authentication
-func executeSSHCommand(command string, d *Driver) error {
-	log.Debugf("Execute executeSSHCommand: %s", command)
-
-	config := &cryptossh.ClientConfig{
-		User: d.SSHUser,
-		Auth: []cryptossh.AuthMethod{
-			cryptossh.Password(d.SSHPassword),
-		},
-	}
-
-	client, err := cryptossh.Dial("tcp", fmt.Sprintf("%s:%d", d.IPAddress, d.SSHPort), config)
-	if err != nil {
-		log.Debugf("Failed to dial:", err)
-		return err
-	}
-
-	session, err := client.NewSession()
-	if err != nil {
-		log.Debugf("Failed to create session: " + err.Error())
-		return err
-	}
-	defer session.Close()
-
-	var b bytes.Buffer
-	session.Stdout = &b
-
-	if err := session.Run(command); err != nil {
-		log.Debugf("Failed to run: " + err.Error())
-		return err
-	}
-	log.Debugf("Stdout from executeSSHCommand: %s", b.String())
-
-	return nil
-}
-
-func mountCommand(shareName, shareDir string) string {
-	// Replace C:\ to / due to Windows/Linux path difference
-	shareDir = strings.Replace(shareDir, "C:\\", "/", 1)
-	return "[ ! -d " + shareDir + " ]&& sudo mkdir " + shareDir + "; sudo mount --bind /mnt/hgfs/" + shareDir + " " + shareDir + " || [ -f /usr/local/bin/vmhgfs-fuse ]&& sudo /usr/local/bin/vmhgfs-fuse -o allow_other .host:/" + shareName + " " + shareDir + " || sudo mount -t vmhgfs -o uid=$(id -u),gid=$(id -g) .host:/" + shareName + " " + shareDir
 }

@@ -34,15 +34,23 @@ import (
 	"github.com/docker/machine/libmachine/log"
 )
 
+type diskType int
+
+const (
+	diskTypeGrowable     diskType = 0
+	diskTypePreallocated diskType = 2
+)
+
 var (
 	vmrunbin    = setVmwareCmd("vmrun")
 	vdiskmanbin = setVmwareCmd("vmware-vdiskmanager")
 )
 
 var (
-	ErrMachineExist    = errors.New("machine already exists")
-	ErrMachineNotExist = errors.New("machine does not exist")
-	ErrVMRUNNotFound   = errors.New("VMRUN not found")
+	ErrMachineExist     = errors.New("machine already exists")
+	ErrMachineNotExist  = errors.New("machine does not exist")
+	ErrVMRUNNotFound    = errors.New("vmrun.exe not found")
+	ErrVDISKMANNotFound = errors.New("vmware-vdiskmanager.exe not found")
 )
 
 func init() {
@@ -57,18 +65,18 @@ func isMachineDebugEnabled() bool {
 
 func vmrun(args ...string) (string, string, error) {
 	cmd := exec.Command(vmrunbin, args...)
-	return vmrun_cmd(cmd)
+	return vmrunCmd(cmd)
 }
 
-func vmrun_wait(timeout time.Duration, args ...string) (string, string, error) {
+func vmrunWait(timeout time.Duration, args ...string) (string, string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, vmrunbin, args...)
-	return vmrun_cmd(cmd)
+	return vmrunCmd(cmd)
 }
 
-func vmrun_cmd(cmd *exec.Cmd) (string, string, error) {
+func vmrunCmd(cmd *exec.Cmd) (string, string, error) {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
@@ -91,9 +99,8 @@ func vmrun_cmd(cmd *exec.Cmd) (string, string, error) {
 	return stdout.String(), stderr.String(), err
 }
 
-// Make a vmdk disk image with the given size (in MB).
-func vdiskmanager(dest string, size int) error {
-	cmd := exec.Command(vdiskmanbin, "-c", "-t", "0", "-s", fmt.Sprintf("%dMB", size), "-a", "lsilogic", dest)
+func vdiskmanager(args ...string) error {
+	cmd := exec.Command(vdiskmanbin, args...)
 	if isMachineDebugEnabled() {
 		// write stdout to stderr because stdout is used for parsing sometimes
 		cmd.Stdout = os.Stderr
@@ -102,8 +109,21 @@ func vdiskmanager(dest string, size int) error {
 
 	if stdout := cmd.Run(); stdout != nil {
 		if ee, ok := stdout.(*exec.Error); ok && ee == exec.ErrNotFound {
-			return ErrVMRUNNotFound
+			return ErrVDISKMANNotFound
 		}
 	}
 	return nil
+}
+
+// Make a vmdk disk image with the given size (in MB).
+func createDisk(path string, sizeInMB int, diskType diskType) error {
+	return vdiskmanager("-c", "-t", fmt.Sprintf("%d", diskType), "-s", fmt.Sprintf("%dMB", sizeInMB), "-a", "lsilogic", path)
+}
+
+func convertDisk(srcPath string, destPath string, diskType diskType) error {
+	return vdiskmanager("-r", srcPath, "-t", fmt.Sprintf("%d", diskType), destPath)
+}
+
+func growDisk(path string, sizeInMB int) error {
+	return vdiskmanager("-x", fmt.Sprintf("%dMB", sizeInMB), path)
 }

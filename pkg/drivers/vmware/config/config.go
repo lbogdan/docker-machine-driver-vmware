@@ -50,19 +50,19 @@ type Config struct {
 	ConfigDriveURL string
 	NoShare        bool
 
-	WaitIP         int
-	NetworkType    string
+	WaitIP      int
+	NetworkType string
 }
 
 // NewConfig creates a new Config
 func NewConfig(hostname, storePath string) *Config {
 	return &Config{
-		CPU:            defaultCPU,
-		Memory:         defaultMemory,
-		DiskSize:       defaultDiskSize,
-		SSHPassword:    defaultSSHPass,
-		WaitIP:         defaultWaitIP,
-		NetworkType:    defaultNetworkType,
+		CPU:         defaultCPU,
+		Memory:      defaultMemory,
+		DiskSize:    defaultDiskSize,
+		SSHPassword: defaultSSHPass,
+		WaitIP:      defaultWaitIP,
+		NetworkType: defaultNetworkType,
 		BaseDriver: &drivers.BaseDriver{
 			SSHUser:     defaultSSHUser,
 			MachineName: hostname,

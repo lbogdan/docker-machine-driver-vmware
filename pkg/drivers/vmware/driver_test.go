@@ -17,26 +17,12 @@ limitations under the License.
 package vmware
 
 import (
-	"io/ioutil"
-	"log"
 	"os"
 	"testing"
 
 	"github.com/docker/machine/libmachine/drivers"
 	"github.com/docker/machine/libmachine/state"
 )
-
-var skip = !check(vmrunbin) || !check(vdiskmanbin)
-
-func check(path string) bool {
-	_, err := os.Stat(path)
-	if err != nil {
-		log.Printf("%q is missing", path)
-		return false
-	}
-
-	return true
-}
 
 func TestSetConfigFromFlags(t *testing.T) {
 	driver := NewDriver("default", "path")
@@ -62,7 +48,7 @@ func TestDriver(t *testing.T) {
 		t.Skip()
 	}
 
-	path, err := ioutil.TempDir("", "vmware-driver-test")
+	path, err := os.MkdirTemp("", "vmware-driver-test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +74,12 @@ func TestDriver(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	defer driver.Remove()
+	defer func() {
+		err := driver.Remove()
+		if err != nil {
+			t.Fatalf("error removing driver: %s", err)
+		}
+	}()
 
 	st, err := driver.GetState()
 	if err != nil {
