@@ -65,18 +65,18 @@ func isMachineDebugEnabled() bool {
 
 func vmrun(args ...string) (string, string, error) {
 	cmd := exec.Command(vmrunbin, args...)
-	return vmrun_cmd(cmd)
+	return vmrunCmd(cmd)
 }
 
-func vmrun_wait(timeout time.Duration, args ...string) (string, string, error) {
+func vmrunWait(timeout time.Duration, args ...string) (string, string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, vmrunbin, args...)
-	return vmrun_cmd(cmd)
+	return vmrunCmd(cmd)
 }
 
-func vmrun_cmd(cmd *exec.Cmd) (string, string, error) {
+func vmrunCmd(cmd *exec.Cmd) (string, string, error) {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
