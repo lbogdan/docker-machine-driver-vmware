@@ -40,7 +40,3 @@ func setVmwareCmd(cmd string) string {
 	}
 	return cmd
 }
-
-func getShareDriveAndName() (string, string, string) {
-	return "hosthome", "/home", "/hosthome"
-}

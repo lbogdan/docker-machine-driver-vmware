@@ -40,7 +40,6 @@ import (
 	"github.com/docker/machine/libmachine/ssh"
 	"github.com/docker/machine/libmachine/state"
 	"github.com/machine-drivers/docker-machine-driver-vmware/pkg/drivers/vmware/config"
-	cryptossh "golang.org/x/crypto/ssh"
 )
 
 const (
@@ -355,92 +354,9 @@ func (d *Driver) Start() error {
 		return fmt.Errorf("machine didn't return an IP after 120 seconds, aborting")
 	}
 
-	// we got an IP, let's copy ssh keys over
+	// we got an IP
 	d.IPAddress = ip
 
-	// Do not execute the rest of boot2docker specific configuration
-	// The upload of the public ssh key uses a ssh connection,
-	// this works without installed vmware client tools
-	if d.ConfigDriveURL != "" {
-		var keyfh *os.File
-		var keycontent []byte
-
-		log.Infof("Copy public SSH key to %s [%s]", d.MachineName, d.IPAddress)
-
-		// create .ssh folder in users home
-		if err := executeSSHCommand(fmt.Sprintf("mkdir -p /home/%s/.ssh", d.SSHUser), d); err != nil {
-			return err
-		}
-
-		// read generated public ssh key
-		if keyfh, err = os.Open(d.publicSSHKeyPath()); err != nil {
-			return err
-		}
-		defer keyfh.Close()
-
-		if keycontent, err = io.ReadAll(keyfh); err != nil {
-			return err
-		}
-
-		// add public ssh key to authorized_keys
-		if err := executeSSHCommand(fmt.Sprintf("echo '%s' > /home/%s/.ssh/authorized_keys", string(keycontent), d.SSHUser), d); err != nil {
-			return err
-		}
-
-		// make it secure
-		if err := executeSSHCommand(fmt.Sprintf("chmod 600 /home/%s/.ssh/authorized_keys", d.SSHUser), d); err != nil {
-			return err
-		}
-
-		log.Debugf("Leaving create sequence early, configdrive found")
-		return nil
-	}
-
-	// Generate a tar keys bundle
-	if err := d.generateKeyBundle(); err != nil {
-		return err
-	}
-
-	// Test if /var/lib/boot2docker exists
-	if _, _, err = vmrun("-gu", d.SSHUser, "-gp", d.SSHPassword, "directoryExistsInGuest", d.vmxPath(), "/var/lib/boot2docker"); err != nil {
-		return err
-	}
-
-	// Copy SSH keys bundle
-	if _, _, err = vmrun("-gu", d.SSHUser, "-gp", d.SSHPassword, "CopyFileFromHostToGuest", d.vmxPath(), d.ResolveStorePath("userdata.tar"), "/home/docker/userdata.tar"); err != nil {
-		return err
-	}
-
-	// Expand tar file.
-	if _, _, err = vmrun("-gu", d.SSHUser, "-gp", d.SSHPassword, "runScriptInGuest", d.vmxPath(), "/bin/sh", "sudo sh -c \"tar xvf /home/docker/userdata.tar -C /home/docker > /var/log/userdata.log 2>&1 && chown -R docker:staff /home/docker\""); err != nil {
-		return err
-	}
-
-	// copy to /var/lib/boot2docker
-	if _, _, err = vmrun("-gu", d.SSHUser, "-gp", d.SSHPassword, "runScriptInGuest", d.vmxPath(), "/bin/sh", "sudo /bin/mv /home/docker/userdata.tar /var/lib/boot2docker/userdata.tar"); err != nil {
-		return err
-	}
-
-	// Enable Shared Folders
-	if _, _, err = vmrun("-gu", d.SSHUser, "-gp", d.SSHPassword, "enableSharedFolders", d.vmxPath()); err != nil {
-		return err
-	}
-
-	shareName, hostDir, shareDir := getShareDriveAndName()
-	if hostDir != "" && !d.NoShare {
-		if _, err := os.Stat(hostDir); err != nil && !os.IsNotExist(err) {
-			return err
-		} else if !os.IsNotExist(err) {
-			// add shared folder, create mountpoint and mount it.
-			if _, _, err = vmrun("-gu", d.SSHUser, "-gp", d.SSHPassword, "addSharedFolder", d.vmxPath(), shareName, hostDir); err != nil {
-				return err
-			}
-			command := mountCommand(shareName, shareDir)
-			if _, _, err = vmrun("-gu", d.SSHUser, "-gp", d.SSHPassword, "runScriptInGuest", d.vmxPath(), "/bin/sh", command); err != nil {
-				return err
-			}
-		}
-	}
 	return nil
 }
 
@@ -709,97 +625,4 @@ func (d *Driver) getIPfromDHCPLeaseFile(dhcpfile, macaddr string) (string, error
 
 func (d *Driver) publicSSHKeyPath() string {
 	return d.GetSSHKeyPath() + ".pub"
-}
-
-// Make a boot2docker userdata.tar key bundle
-func (d *Driver) generateKeyBundle() error {
-	log.Debugf("Creating Tar key bundle...")
-
-	magicString := "boot2docker, this is vmware speaking"
-
-	tf, err := os.Create(d.ResolveStorePath("userdata.tar"))
-	if err != nil {
-		return err
-	}
-	defer tf.Close()
-	var fileWriter = tf
-
-	tw := tar.NewWriter(fileWriter)
-	defer tw.Close()
-
-	// magicString first so we can figure out who originally wrote the tar.
-	file := &tar.Header{Name: magicString, Size: int64(len(magicString))}
-	if err := tw.WriteHeader(file); err != nil {
-		return err
-	}
-	if _, err := tw.Write([]byte(magicString)); err != nil {
-		return err
-	}
-	// .ssh/key.pub => authorized_keys
-	file = &tar.Header{Name: ".ssh", Typeflag: tar.TypeDir, Mode: 0700}
-	if err := tw.WriteHeader(file); err != nil {
-		return err
-	}
-	pubKey, err := os.ReadFile(d.publicSSHKeyPath())
-	if err != nil {
-		return err
-	}
-	file = &tar.Header{Name: ".ssh/authorized_keys", Size: int64(len(pubKey)), Mode: 0644}
-	if err := tw.WriteHeader(file); err != nil {
-		return err
-	}
-	if _, err := tw.Write(pubKey); err != nil {
-		return err
-	}
-	file = &tar.Header{Name: ".ssh/authorized_keys2", Size: int64(len(pubKey)), Mode: 0644}
-	if err := tw.WriteHeader(file); err != nil {
-		return err
-	}
-	if _, err := tw.Write(pubKey); err != nil {
-		return err
-	}
-
-	return tw.Close()
-}
-
-// execute command over SSH with user / password authentication
-func executeSSHCommand(command string, d *Driver) error {
-	log.Debugf("Execute executeSSHCommand: %s", command)
-
-	config := &cryptossh.ClientConfig{
-		User: d.SSHUser,
-		Auth: []cryptossh.AuthMethod{
-			cryptossh.Password(d.SSHPassword),
-		},
-	}
-
-	client, err := cryptossh.Dial("tcp", fmt.Sprintf("%s:%d", d.IPAddress, d.SSHPort), config)
-	if err != nil {
-		log.Debugf("Failed to dial:", err)
-		return err
-	}
-
-	session, err := client.NewSession()
-	if err != nil {
-		log.Debugf("Failed to create session: " + err.Error())
-		return err
-	}
-	defer session.Close()
-
-	var b bytes.Buffer
-	session.Stdout = &b
-
-	if err := session.Run(command); err != nil {
-		log.Debugf("Failed to run: " + err.Error())
-		return err
-	}
-	log.Debugf("Stdout from executeSSHCommand: %s", b.String())
-
-	return nil
-}
-
-func mountCommand(shareName, shareDir string) string {
-	// Replace C:\ to / due to Windows/Linux path difference
-	shareDir = strings.Replace(shareDir, "C:\\", "/", 1)
-	return "[ ! -d " + shareDir + " ]&& sudo mkdir " + shareDir + "; sudo mount --bind /mnt/hgfs/" + shareDir + " " + shareDir + " || [ -f /usr/local/bin/vmhgfs-fuse ]&& sudo /usr/local/bin/vmhgfs-fuse -o allow_other .host:/" + shareName + " " + shareDir + " || sudo mount -t vmhgfs -o uid=$(id -u),gid=$(id -g) .host:/" + shareName + " " + shareDir
 }
